@@ -12,6 +12,8 @@ services:
         value: "22"
       - key: ARCHIVE_EXT
         value: "7"
+      - key: GEMINI_VOICE
+        value: "Puck"
       - key: GEMINI_API_KEY
         sync: false
       - key: YEMOT_TOKEN
