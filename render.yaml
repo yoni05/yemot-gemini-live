@@ -10,6 +10,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
+      - key: ARCHIVE_EXT
+        value: "7"
       - key: GEMINI_API_KEY
         sync: false
       - key: YEMOT_TOKEN
