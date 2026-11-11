@@ -6,17 +6,20 @@ app.use(express.json());
 
 const TOKEN = (process.env.YEMOT_TOKEN || '').trim();
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const DEFAULT_ARCHIVE_EXT = (process.env.ARCHIVE_EXT || '8').trim();
 const YM = 'https://www.call2all.co.il/ym/api/';
-const TEXT_ARCHIVE_EXT = '8';
 
 let cachedModelList = null;
 let lastModelFetchTime = 0;
 const lastAnswerByPhone = new Map();
 const conversationHistoryByCall = new Map();
 let globalLastAnswer = null;
-const folderCounters = {};
 
-async function fetchWithTimeout(url, options = {}, timeout = 20000) {
+// מונה קבצים חכם בזיכרון (חוסך קריאת רשת לימות המשיח בכל שלב בשיחה ומאיץ מאוד את המענה)
+const folderCounters = {};
+const folderInitialized = {};
+
+async function fetchWithTimeout(url, options = {}, timeout = 15000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
     try {
@@ -29,42 +32,54 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-async function getNextFileNumberStr(folder) {
-    const cleanFolder = String(folder || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    const folderPath = cleanFolder ? `ivr2:/${cleanFolder}` : `ivr2:/`;
-    let maxExisting = -1;
+function normalizeFolder(folder) {
+    return String(folder || DEFAULT_ARCHIVE_EXT)
+        .replace(/^ivr2:\/*/, '')
+        .replace(/^\/*/, '')
+        .replace(/\/*$/, '') || '8';
+}
 
-    try {
-        const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
-        const res = await fetchWithTimeout(url, {}, 7000);
-        if (res.ok) {
-            const data = await res.json();
-            const files = data.files || [];
-            for (const f of files) {
-                const fname = (typeof f === 'string') ? f : (f && (f.name || f.fileName || ''));
-                const m = String(fname).match(/^(\d+)\.(wav|tts|txt|mp3)$/i);
-                if (m) {
-                    const num = parseInt(m[1], 10);
-                    if (!isNaN(num) && num < 99999 && num > maxExisting) {
-                        maxExisting = num;
+// שליפה מהירה במיוחד: בודקת את התיקייה בימות המשיח רק פעם אחת בהפעלה, ומאז מקדמת מונה בזיכרון באפס זמן
+async function getNextFileNumberStr(folder) {
+    const cleanFolder = normalizeFolder(folder);
+    const folderPath = `ivr2:/${cleanFolder}`;
+
+    if (!folderInitialized[cleanFolder]) {
+        let maxExisting = -1;
+        try {
+            const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
+            const res = await fetchWithTimeout(url, {}, 4000);
+            if (res.ok) {
+                const data = await res.json();
+                const files = data.files || [];
+                for (const f of files) {
+                    const fname = (typeof f === 'string') ? f : (f && (f.name || f.fileName || ''));
+                    const m = String(fname).match(/^(?:rec_)?(\d+)\.(wav|tts|txt|mp3)$/i);
+                    if (m) {
+                        const num = parseInt(m[1], 10);
+                        if (!isNaN(num) && num < 99999 && num > maxExisting) {
+                            maxExisting = num;
+                        }
                     }
                 }
             }
+            folderInitialized[cleanFolder] = true;
+            folderCounters[cleanFolder] = maxExisting;
+        } catch (e) {
+            console.warn(`[GetIVR2Dir] Fast fallback for ${folderPath}:`, e.message);
+            if (folderCounters[cleanFolder] === undefined) folderCounters[cleanFolder] = 0;
         }
-    } catch (e) {
-        console.warn(`[GetIVR2Dir] Warning checking ${folderPath}:`, e.message);
     }
 
-    const currentMem = (folderCounters[cleanFolder] !== undefined) ? folderCounters[cleanFolder] : -1;
-    const nextNum = Math.max(maxExisting, currentMem) + 1;
+    const nextNum = (folderCounters[cleanFolder] !== undefined ? folderCounters[cleanFolder] : -1) + 1;
     folderCounters[cleanFolder] = nextNum;
     return String(nextNum).padStart(3, '0');
 }
 
-// 1. הורדת ההקלטה משלוחת העוזר הקולי
-async function downloadRecordingFromYemot(recordPath, apiDir) {
+// 1. הורדת ההקלטה מימות המשיח
+async function downloadRecordingFromYemot(recordPath, fallbackDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
-    const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+    const cleanDir = normalizeFolder(fallbackDir);
 
     const candidates = [
         `ivr2:/${cleanPath}`,
@@ -83,7 +98,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     for (const p of uniquePaths) {
         const url = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(p)}`;
         try {
-            const res = await fetchWithTimeout(url, {}, 12000);
+            const res = await fetchWithTimeout(url, {}, 9000);
             if (!res.ok) {
                 lastYemotResponse = `HTTP_${res.status}`;
                 continue;
@@ -104,7 +119,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     throw new Error('YEMOT_DOWNLOAD_ERR: ' + lastYemotResponse);
 }
 
-// 2. איתור מודלים זמינים - עדיפות למודל Flash החכם והמדויק ביותר לפני Lite
+// 2. איתור מודלים מהירים וחכמים
 async function getSmartGeminiModels() {
     const preferredSmartOrder = [
         'gemini-3.5-flash',
@@ -114,12 +129,12 @@ async function getSmartGeminiModels() {
         'gemini-flash-lite-latest'
     ];
 
-    if (cachedModelList && (Date.now() - lastModelFetchTime < 300000)) {
+    if (cachedModelList && (Date.now() - lastModelFetchTime < 600000)) {
         return cachedModelList;
     }
 
     try {
-        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 6000);
+        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 4500);
         if (res.ok) {
             const data = await res.json();
             const available = (data.models || [])
@@ -158,13 +173,13 @@ async function getSmartGeminiModels() {
     return preferredSmartOrder;
 }
 
-// 3. תמלול מדויק של השאלה
+// 3. תמלול מהיר ומדויק של השאלה
 async function transcribeAudio(audioBase64) {
     const modelsToTry = await getSmartGeminiModels();
-    const prompt = 'תמלל את ההקלטה לעברית מילה במילה בצורה המדויקת ביותר. אם נאמרו מילים באנגלית או בשפה אחרת לצורך תרגום או חיפוש, כתוב אותן כפי שנאמרו. החזר אך ורק את המילים שנאמרו ללא שום תוספת.';
+    const prompt = 'תמלל את ההקלטה לעברית מילה במילה בצורה המדויקת ביותר. אם נאמרו מילים בשפה אחרת לצורך תרגום או חיפוש, כתוב אותן כפי שנאמרו. החזר אך ורק את המילים שנאמרו ללא שום תוספת.';
 
     let lastErr = '';
-    for (const model of modelsToTry.slice(0, 5)) {
+    for (const model of modelsToTry.slice(0, 4)) {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
         try {
             const res = await fetchWithTimeout(url, {
@@ -178,11 +193,11 @@ async function transcribeAudio(audioBase64) {
                         ]
                     }],
                     generationConfig: {
-                        temperature: 0.1,
-                        maxOutputTokens: 1024
+                        temperature: 0.05,
+                        maxOutputTokens: 512
                     }
                 })
-            }, 12000);
+            }, 9000);
 
             if (res.ok) {
                 const data = await res.json();
@@ -194,7 +209,6 @@ async function transcribeAudio(audioBase64) {
                 }
             } else {
                 lastErr = await res.text();
-                console.warn(`[Transcribe ${model} failed ${res.status}]:`, lastErr.slice(0, 140));
             }
         } catch (err) {
             lastErr = err.message;
@@ -203,7 +217,7 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_TRANSCRIBE_ERR: ' + lastErr);
 }
 
-// 4. מנועי חיפוש ייעודיים: ויקיפדיה, תרגום גוגל, יוטיוב, אינטרנט, חדשות ומזג אוויר
+// 4. מנועי חיפוש מהירים במקביל (ויקיפדיה, תרגום גוגל, יוטיוב, אינטרנט, חדשות ומזג אוויר)
 function stripHtmlTags(str) {
     return String(str || '')
         .replace(/<[^>]*>/g, ' ')
@@ -223,50 +237,47 @@ function cleanQueryForSearch(queryText) {
         .trim() || queryText;
 }
 
-// 4א. חיפוש ישיר ב-API של ויקיפדיה (עברית + אנגלית)
 async function searchWikipedia(queryText) {
     try {
         const cleanQ = cleanQueryForSearch(queryText);
         if (!cleanQ || cleanQ.length < 2) return '';
 
-        const heUrl = `https://he.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(cleanQ)}&utf8=&format=json&srlimit=3`;
+        const heUrl = `https://he.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(cleanQ)}&utf8=&format=json&srlimit=2`;
         const res = await fetchWithTimeout(heUrl, {
-            headers: { 'User-Agent': 'YemotVoiceAssistant/11.0 (https://call2all.co.il)' }
-        }, 4500);
+            headers: { 'User-Agent': 'YemotVoiceAssistant/12.0' }
+        }, 2800);
 
         const summaries = [];
         if (res.ok) {
             const data = await res.json();
             const searchResults = data?.query?.search || [];
-            for (const item of searchResults.slice(0, 2)) {
+            const summaryPromises = searchResults.slice(0, 2).map(async (item) => {
                 const title = item.title;
                 const sumUrl = `https://he.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
                 try {
                     const sumRes = await fetchWithTimeout(sumUrl, {
-                        headers: { 'User-Agent': 'YemotVoiceAssistant/11.0' }
-                    }, 3500);
+                        headers: { 'User-Agent': 'YemotVoiceAssistant/12.0' }
+                    }, 2200);
                     if (sumRes.ok) {
                         const sumData = await sumRes.json();
                         if (sumData.extract) {
-                            summaries.push(`- מתוך ויקיפדיה ("${title}"): ${sumData.extract}`);
-                            continue;
+                            return `- מתוך ויקיפדיה ("${title}"): ${sumData.extract}`;
                         }
                     }
                 } catch (e) {}
-                summaries.push(`- מתוך ויקיפדיה ("${title}"): ${stripHtmlTags(item.snippet)}`);
-            }
+                return `- מתוך ויקיפדיה ("${title}"): ${stripHtmlTags(item.snippet)}`;
+            });
+            const resolved = await Promise.all(summaryPromises);
+            summaries.push(...resolved.filter(Boolean));
         }
 
         if (summaries.length > 0) {
             return `תוצאות מדויקות מוויקיפדיה עבור "${cleanQ}":\n${summaries.join('\n')}`;
         }
-    } catch (e) {
-        console.warn('[Wikipedia Search Warning]:', e.message);
-    }
+    } catch (e) {}
     return '';
 }
 
-// 4ב. תרגום חי ומדויק דרך Google Translate API
 async function translateTextLive(queryText) {
     try {
         const isTranslationQuery = /תרגם|לתרגם|איך אומרים|באנגלית|בעברית|ביידיש|בצרפתית|בספרדית|ברוסית|בערבית|פירוש המילה|מה הפירוש/i.test(queryText);
@@ -286,9 +297,7 @@ async function translateTextLive(queryText) {
             .trim() || queryText;
 
         const gtUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(phraseToTranslate)}`;
-        const res = await fetchWithTimeout(gtUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        }, 4000);
+        const res = await fetchWithTimeout(gtUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 2500);
 
         if (res.ok) {
             const data = await res.json();
@@ -299,13 +308,10 @@ async function translateTextLive(queryText) {
                 }
             }
         }
-    } catch (e) {
-        console.warn('[Google Translate Warning]:', e.message);
-    }
+    } catch (e) {}
     return '';
 }
 
-// 4ג. חיפוש סרטונים ושיעורים חיים ביוטיוב
 async function searchYouTubeLatestVideos(queryText) {
     try {
         const cleanQ = cleanQueryForSearch(queryText);
@@ -313,8 +319,8 @@ async function searchYouTubeLatestVideos(queryText) {
         const ytRelevanceUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanQ)}`;
 
         const [dateRes, relRes] = await Promise.allSettled([
-            fetchWithTimeout(ytUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'he-IL,he;q=0.9' } }, 5000),
-            fetchWithTimeout(ytRelevanceUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'he-IL,he;q=0.9' } }, 5000)
+            fetchWithTimeout(ytUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'he-IL,he;q=0.9' } }, 2800),
+            fetchWithTimeout(ytRelevanceUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'he-IL,he;q=0.9' } }, 2800)
         ]);
 
         const extractYtVideos = (html) => {
@@ -337,40 +343,29 @@ async function searchYouTubeLatestVideos(queryText) {
             combined.push(...extractYtVideos(html));
         }
 
-        const unique = [...new Set(combined)].slice(0, 6);
+        const unique = [...new Set(combined)].slice(0, 5);
         if (unique.length > 0) {
             return `תוצאות חיות מיוטיוב עבור "${cleanQ}":\n${unique.join('\n')}`;
         }
-    } catch (e) {
-        console.warn('[YouTube Live Search Warning]:', e.message);
-    }
+    } catch (e) {}
     return '';
 }
 
-// 4ד. חיפוש אינטרנט יציב (ללא חסימות וביטולי Aborted)
 async function searchStableWeb(queryText) {
     try {
         const cleanQ = cleanQueryForSearch(queryText);
         const results = [];
 
-        // ניסיון 1: DuckDuckGo Instant Answer JSON API (מהיר ולא נחסם בשרתי ענן)
         const ddgApiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(cleanQ)}&format=json&no_html=1&skip_disambig=1`;
-        const ddgPromise = fetchWithTimeout(ddgApiUrl, {}, 3500)
-            .then(r => r.ok ? r.json() : null)
-            .catch(() => null);
-
-        // ניסיון 2: חיפוש רחב ב-Google Web/News RSS
         const googleRssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(cleanQ)}&hl=iw&gl=IL&ceid=IL:he`;
-        const rssPromise = fetchWithTimeout(googleRssUrl, {}, 4000)
-            .then(r => r.ok ? r.text() : '')
-            .catch(() => '');
 
-        const [ddgData, rssXml] = await Promise.all([ddgPromise, rssPromise]);
+        const [ddgData, rssXml] = await Promise.all([
+            fetchWithTimeout(ddgApiUrl, {}, 2500).then(r => r.ok ? r.json() : null).catch(() => null),
+            fetchWithTimeout(googleRssUrl, {}, 2800).then(r => r.ok ? r.text() : '').catch(() => '')
+        ]);
 
         if (ddgData) {
-            if (ddgData.AbstractText) {
-                results.push(`- תקציר רשת: ${ddgData.AbstractText}`);
-            }
+            if (ddgData.AbstractText) results.push(`- תקציר רשת: ${ddgData.AbstractText}`);
             if (Array.isArray(ddgData.RelatedTopics)) {
                 for (const t of ddgData.RelatedTopics.slice(0, 3)) {
                     if (t && t.Text) results.push(`- מידע נוסף: ${t.Text}`);
@@ -398,9 +393,7 @@ async function searchStableWeb(queryText) {
         if (results.length > 0) {
             return `תוצאות חיפוש רשת עבור "${cleanQ}":\n${results.join('\n')}`;
         }
-    } catch (e) {
-        console.warn('[Stable Web Search Info]:', e.message);
-    }
+    } catch (e) {}
     return '';
 }
 
@@ -415,22 +408,14 @@ async function fetchAllLiveSources(questionText) {
             translateTextLive(questionText),
             searchStableWeb(questionText),
             searchYouTubeLatestVideos(questionText),
-            fetchWithTimeout(topNewsUrl, {}, 4000),
-            fetchWithTimeout(weatherUrl, {}, 4000)
+            fetchWithTimeout(topNewsUrl, {}, 2600),
+            fetchWithTimeout(weatherUrl, {}, 2600)
         ]);
 
-        if (transRes.status === 'fulfilled' && transRes.value) {
-            snippets.push(transRes.value);
-        }
-        if (wikiRes.status === 'fulfilled' && wikiRes.value) {
-            snippets.push(wikiRes.value);
-        }
-        if (webRes.status === 'fulfilled' && webRes.value) {
-            snippets.push(webRes.value);
-        }
-        if (ytRes.status === 'fulfilled' && ytRes.value) {
-            snippets.push(ytRes.value);
-        }
+        if (transRes.status === 'fulfilled' && transRes.value) snippets.push(transRes.value);
+        if (wikiRes.status === 'fulfilled' && wikiRes.value) snippets.push(wikiRes.value);
+        if (webRes.status === 'fulfilled' && webRes.value) snippets.push(webRes.value);
+        if (ytRes.status === 'fulfilled' && ytRes.value) snippets.push(ytRes.value);
 
         if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
             const wData = await weatherRes.value.json();
@@ -451,23 +436,20 @@ async function fetchAllLiveSources(questionText) {
             while ((m = itemRegex.exec(xml)) !== null && items.length < 5) {
                 const block = m[1];
                 const tMatch = block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
-                if (tMatch && tMatch[1]) {
-                    items.push(`- ${stripHtmlTags(tMatch[1])}`);
-                }
+                if (tMatch && tMatch[1]) items.push(`- ${stripHtmlTags(tMatch[1])}`);
             }
-            if (items.length > 0) {
-                snippets.push(`כותרות החדשות הראשיות בישראל כעת:\n${items.join('\n')}`);
-            }
+            if (items.length > 0) snippets.push(`כותרות החדשות הראשיות בישראל כעת:\n${items.join('\n')}`);
         }
-    } catch (e) {
-        console.warn('[Live Context Error]:', e.message);
-    }
+    } catch (e) {}
     return snippets.join('\n\n');
 }
 
-// 5. מענה חכם ומדויק המשלב את כל מקורות המידע החיים
+// 5. מענה חכם ומהיר ב-Gemini
 async function answerQuestionWithLiveSearch(questionText, callHistory = []) {
-    const models = await getSmartGeminiModels();
+    const [models, liveWebData] = await Promise.all([
+        getSmartGeminiModels(),
+        fetchAllLiveSources(questionText)
+    ]);
 
     const now = new Date();
     const nowStr = now.toLocaleString('he-IL', {
@@ -480,7 +462,6 @@ async function answerQuestionWithLiveSearch(questionText, callHistory = []) {
         minute: '2-digit'
     });
 
-    const liveWebData = await fetchAllLiveSources(questionText);
     console.log(`[Live Search Context Gathered] (${liveWebData.length} chars)`);
 
     let historyContext = '';
@@ -497,12 +478,11 @@ ${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמ�
 הנחיות מחייבות:
 1. ענה ישירות ובדיוק מרבי על שאלת המשתמש בהתבסס על הנתונים החיים שלמעלה ועל הידע שלך.
 2. אם השאלה עוסקת בוויקיפדיה, תרגום, סרטונים ביוטיוב, חדשות או מזג אוויר - התבסס בראש ובראשונה על התוצאות החיות שמופיעות למעלה.
-3. נסח תשובה ברורה, מלאה וטבעית להקראה בטלפון בעברית (בין 2 ל-6 משפטים שלמים). אל תקטע משפטים באמצע.
+3. נסח תשובה ברורה, מלאה וטבעית להקראה בטלפון בעברית (בין 2 ל-5 משפטים שלמים). אל תקטע משפטים באמצע.
 4. כתוב טקסט נקי בלבד ללא כוכביות, ללא סולמיות, ללא קישורים וללא תווי עיצוב.`;
 
     let lastErr = '';
-
-    for (const model of models.slice(0, 5)) {
+    for (const model of models.slice(0, 4)) {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
         try {
             const res = await fetchWithTimeout(url, {
@@ -512,10 +492,10 @@ ${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמ�
                     contents: [{ parts: [{ text: prompt }] }],
                     generationConfig: {
                         temperature: 0.2,
-                        maxOutputTokens: 2048
+                        maxOutputTokens: 1536
                     }
                 })
-            }, 16000);
+            }, 13000);
 
             if (res.ok) {
                 const data = await res.json();
@@ -527,9 +507,7 @@ ${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמ�
                     return answer;
                 }
             } else {
-                const errTxt = await res.text();
-                console.warn(`[Model ${model} failed ${res.status}]:`, errTxt.slice(0, 160));
-                lastErr = errTxt;
+                lastErr = await res.text();
             }
         } catch (err) {
             lastErr = err.message;
@@ -538,7 +516,68 @@ ${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמ�
     throw new Error('GEMINI_ANSWER_ERR: ' + lastErr);
 }
 
-// 6. ניקוי הטקסט והרכבת פקודת השמעה תקנית לימות המשיח
+// 6. יצירת קובץ שמע אמיתי (WAV) דרך מודל ה-TTS של Gemini (פועל ברקע בלי לעכב את השיחה!)
+function pcmToWavBuffer(pcmBuffer, sampleRate = 24000, numChannels = 1, bitsPerSample = 16) {
+    const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+    const blockAlign = numChannels * (bitsPerSample / 8);
+    const dataSize = pcmBuffer.length;
+    const header = Buffer.alloc(44);
+
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + dataSize, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20); // PCM
+    header.writeUInt16LE(numChannels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(dataSize, 40);
+
+    return Buffer.concat([header, pcmBuffer]);
+}
+
+async function generateGeminiTtsWavBuffer(textToSpeak) {
+    const ttsModels = ['gemini-2.5-flash-preview-tts', 'gemini-2.5-pro-preview-tts'];
+    for (const model of ttsModels) {
+        try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
+            const res = await fetchWithTimeout(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: `קרא בקול ברור וטבעי בעברית: ${textToSpeak}` }] }],
+                    generationConfig: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: {
+                            voiceConfig: {
+                                prebuiltVoiceConfig: { voiceName: 'Aoede' }
+                            }
+                        }
+                    }
+                })
+            }, 14000);
+
+            if (res.ok) {
+                const data = await res.json();
+                const inline = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+                if (inline && inline.data) {
+                    const rawBuf = Buffer.from(inline.data, 'base64');
+                    if (rawBuf.slice(0, 4).toString('ascii') === 'RIFF') {
+                        return rawBuf;
+                    }
+                    return pcmToWavBuffer(rawBuf, 24000, 1, 16);
+                }
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
+// 7. ניקוי הטקסט והרכבת פקודת השמעה תקנית לימות המשיח
 function sanitizeForYemotTts(rawText) {
     return String(rawText || '')
         .replace(/https?:\/\/\S+/gi, ' ')
@@ -570,42 +609,58 @@ function buildYemotTtsPlayCommand(rawText) {
     return chunks.slice(0, 20).map(c => `t-${c}`).join('.');
 }
 
-// 7. שמירת השאלה, התשובה וההקלטה בארכיון שלוחה 8 (ללא דריסה)
-async function saveArchiveToExt8(questionText, answerText, callerPhone, recFilePath, audioBuf) {
+// 8. שמירת השאלה, התשובה וקובץ הקול של Gemini בשלוחת הארכיון שנבחרה (ברקע - אפס עיכוב בשיחה)
+async function saveArchiveToSelectedExt(archiveExt, questionText, answerText, callerPhone, recFilePath) {
     try {
-        const nextNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+        const targetExt = normalizeFolder(archiveExt);
+        const nextNum = await getNextFileNumberStr(targetExt);
         const nowStr = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
         const cleanAns = sanitizeForYemotTts(answerText);
         const cleanQ = sanitizeForYemotTts(questionText);
+        const fullSpokenText = `שאלה: ${cleanQ}. תשובה: ${cleanAns}`;
 
-        // שמירת קובץ השמעה מאוחד של השאלה והתשובה בשלוחה 8
-        const ttsTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${nextNum}.tts`;
+        // א. שמירה מיידית של קובץ השמעה .tts וקובץ פירוט .txt בשלוחת הארכיון שנבחרה
+        const ttsTargetPath = `ivr2:/${targetExt}/${nextNum}.tts`;
         const ttsForm = new FormData();
         ttsForm.append('token', TOKEN);
         ttsForm.append('path', ttsTargetPath);
         ttsForm.append('convertAudio', '0');
-        ttsForm.append('file', new Blob([Buffer.from(`שאלה, ${cleanQ}, תשובה, ${cleanAns}`, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.tts`);
+        ttsForm.append('file', new Blob([Buffer.from(fullSpokenText, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.tts`);
 
-        await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: ttsForm }, 12000);
-
-        // שמירת קובץ טקסט מפורט בשלוחה 8
         const txtDetails = `שאלה: ${questionText}\r\nתשובה: ${answerText}\r\nטלפון: ${callerPhone || 'לא ידוע'}\r\nזמן: ${nowStr}\r\nהקלטה מקורית: ${recFilePath || ''}\r\n`;
-        const txtTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${nextNum}.txt`;
+        const txtTargetPath = `ivr2:/${targetExt}/${nextNum}.txt`;
         const txtForm = new FormData();
         txtForm.append('token', TOKEN);
         txtForm.append('path', txtTargetPath);
         txtForm.append('convertAudio', '0');
         txtForm.append('file', new Blob([Buffer.from(txtDetails, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.txt`);
 
-        await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: txtForm }, 12000);
-        console.log(`[Archive Ext 8] Saved Q&A to ${ttsTargetPath}`);
+        await Promise.allSettled([
+            fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: ttsForm }, 10000),
+            fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: txtForm }, 10000)
+        ]);
+        console.log(`[Archive Ext ${targetExt}] Saved instant TTS & TXT to ${ttsTargetPath}`);
+
+        // ב. הפקת קובץ שמע איכותי (.wav) דרך מודל ה-TTS של Gemini והעלאתו לשלוחת הארכיון (ברקע)
+        const geminiWavBuf = await generateGeminiTtsWavBuffer(fullSpokenText);
+        if (geminiWavBuf && geminiWavBuf.length > 500) {
+            const wavTargetPath = `ivr2:/${targetExt}/${nextNum}.wav`;
+            const wavForm = new FormData();
+            wavForm.append('token', TOKEN);
+            wavForm.append('path', wavTargetPath);
+            wavForm.append('convertAudio', '1');
+            wavForm.append('file', new Blob([geminiWavBuf], { type: 'audio/wav' }), `${nextNum}.wav`);
+
+            await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: wavForm }, 15000);
+            console.log(`[Gemini TTS Audio] Uploaded natural Gemini voice WAV to ${wavTargetPath}`);
+        }
     } catch (err) {
-        console.warn('[Archive Ext 8] Error:', err.message);
+        console.warn(`[Archive Ext Error]:`, err.message);
     }
 }
 
 app.get('/', (req, res) => {
-    res.send('Gemini Live Search Line Server v11.0 OK - Web, Wikipedia, Translate & YouTube Live Search');
+    res.send('Gemini Live Search Line Server v12.0 OK - Fast Memory Counter, Custom Archive Ext & Gemini TTS');
 });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
@@ -621,9 +676,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send('noop');
         }
 
-        const extFolder = String(q.ApiExtension || '2').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+        // קליטת שלוחת ההשמעות והארכיון מהפרמטר בכתובת או ממשתנה הסביבה (ברירת מחדל: 8)
+        const archiveExt = normalizeFolder(q.archive || DEFAULT_ARCHIVE_EXT);
+        const recFolder = `/${archiveExt}`;
         const callerPhone = String(q.ApiPhone || '').trim();
-        const recFolder = `/8`; // שמירת ההקלטות ישירות בשלוחה 8 למניעת דריסה ולריכוז כל הקבצים
 
         const rawRec = q.RecordPath;
         const latestRecordPath = Array.isArray(rawRec) ? rawRec[rawRec.length - 1] : rawRec;
@@ -636,7 +692,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         // הקשה על 2: השמעת התשובה האחרונה ומיד לאחריה פתיחת הקלטה לשאלה חדשה
         if (q.MenuChoice === '2' && !latestRecordPath) {
             const prev = (callerPhone && lastAnswerByPhone.get(callerPhone)) || globalLastAnswer;
-            const nextRecNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+            const nextRecNum = await getNextFileNumberStr(archiveExt);
             if (prev && prev.playCmd) {
                 return res.send(`id_list_message=t-משמיע את התשובה הקודמת.${prev.playCmd}&read=t-לשאלה נוספת אמרו כעת את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${nextRecNum},no,7,1`);
             } else {
@@ -646,17 +702,17 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
         // שלב 1: הקלטת השאלה הראשונה
         if (!latestRecordPath) {
-            const recNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+            const recNum = await getNextFileNumberStr(archiveExt);
             return res.send(`read=t-אנא אמרו את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${recNum},no,7,1`);
         }
 
         // שלב 2: הורדת ההקלטה מימות המשיח
         let audioBuf;
         try {
-            audioBuf = await downloadRecordingFromYemot(latestRecordPath, TEXT_ARCHIVE_EXT);
+            audioBuf = await downloadRecordingFromYemot(latestRecordPath, archiveExt);
         } catch (dlErr) {
             console.error('[Step 2 Error]', dlErr.message);
-            const retryNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+            const retryNum = await getNextFileNumberStr(archiveExt);
             return res.send(`id_list_message=t-שגיאה בקליטת ההקלטה&read=t-אנא אמרו שוב את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${retryNum},no,7,1`);
         }
 
@@ -666,7 +722,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             rawQuestion = await transcribeAudio(audioBuf.toString('base64'));
         } catch (gemErr) {
             console.error('[Step 3 Error]', gemErr.message);
-            const retryNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+            const retryNum = await getNextFileNumberStr(archiveExt);
             return res.send(`id_list_message=t-שגיאה בתקשורת עם מנוע זיהוי הדיבור&read=t-אנא נסו שוב ואמרו את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${retryNum},no,7,1`);
         }
 
@@ -674,18 +730,18 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         console.log('[Step 3 Question]', cleanQuestion);
 
         if (!cleanQuestion) {
-            const retryNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+            const retryNum = await getNextFileNumberStr(archiveExt);
             return res.send(`id_list_message=t-לא הצלחתי לשמוע את השאלה&read=t-אנא אמרו שוב את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${retryNum},no,7,1`);
         }
 
-        // שלב 4: חיפוש חי (אינטרנט, ויקיפדיה, תרגום, יוטיוב, חדשות ומזג אוויר) ומענה ב-Gemini
+        // שלב 4: חיפוש חי מהיר ומענה ב-Gemini
         const callHistory = conversationHistoryByCall.get(callId) || [];
         let rawAnswer = '';
         try {
             rawAnswer = await answerQuestionWithLiveSearch(cleanQuestion, callHistory);
         } catch (searchErr) {
             console.error('[Step 4 Error]', searchErr.message);
-            const retryNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+            const retryNum = await getNextFileNumberStr(archiveExt);
             return res.send(`id_list_message=t-שגיאה בחיפוש התשובה&read=t-אנא אמרו שוב את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${retryNum},no,7,1`);
         }
 
@@ -698,15 +754,15 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         if (callerPhone) lastAnswerByPhone.set(callerPhone, savedInfo);
         globalLastAnswer = savedInfo;
 
-        // שמירה לארכיון שלוחה 8 ברקע
-        saveArchiveToExt8(cleanQuestion, rawAnswer, callerPhone, latestRecordPath, audioBuf);
+        // שמירה לארכיון בשלוחה שנבחרה + הפקת שמע במודל הקול של Gemini (רץ ברקע באפס השהיה למאזין!)
+        saveArchiveToSelectedExt(archiveExt, cleanQuestion, rawAnswer, callerPhone, latestRecordPath);
 
         // שלב 5: השמעת התשובה המלאה ומיד לאחריה המשך שיחה
-        const nextRecNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT);
+        const nextRecNum = await getNextFileNumberStr(archiveExt);
         return res.send(`id_list_message=${playCmd}&read=t-לשאלה נוספת אמרו כעת את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${nextRecNum},no,7,1`);
 
     } catch (e) {
-        console.error('[General Error v11.0]', e.message);
+        console.error('[General Error v12.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -714,4 +770,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Gemini Voice Assistant v11.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Gemini Voice Assistant v12.0 Ready on port ${port} ===`));
