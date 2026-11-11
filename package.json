@@ -1,6 +1,6 @@
 {
-  "name": "yemot-gemini-live-v2",
-  "version": "2.0.0",
+  "name": "yemot-gemini-live-v3",
+  "version": "3.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
