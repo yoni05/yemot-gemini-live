@@ -21,7 +21,7 @@ const lastAnswerByPhone = new Map();
 const conversationHistoryByCall = new Map();
 let globalLastAnswer = null;
 
-// מונה קבצים מהיר בזיכרון (חוסך קריאת רשת לימות המשיח בכל שלב בשיחה)
+// מונה קבצים מהיר בזיכרון
 const folderCounters = {};
 const folderInitialized = {};
 
@@ -116,7 +116,7 @@ async function downloadRecordingFromYemot(recordPath, fallbackDir) {
             const buf = Buffer.from(await res.arrayBuffer());
             const headStr = buf.toString('utf8', 0, Math.min(buf.length, 150));
 
-            if (buf.length > 200 && !headStr.includes('responseStatus') && !headStr.includes('EXCEPTION')) {
+            if (buf.length > 100 && !headStr.includes('responseStatus') && !headStr.includes('EXCEPTION')) {
                 console.log(`[Yemot Download] Success from ${p} (${buf.length} bytes)`);
                 return buf;
             } else {
@@ -183,10 +183,10 @@ async function getSmartGeminiModels() {
     return preferredSmartOrder;
 }
 
-// 3. תמלול מהיר ומדויק של השאלה
+// 3. תמלול מדויק של הדיבור (כולל מילים בודדות כגון "שלום")
 async function transcribeAudio(audioBase64) {
     const modelsToTry = await getSmartGeminiModels();
-    const prompt = 'תמלל את ההקלטה לעברית מילה במילה בצורה המדויקת ביותר. אם נאמרו מילים בשפה אחרת לצורך תרגום או חיפוש, כתוב אותן כפי שנאמרו. החזר אך ורק את המילים שנאמרו ללא שום תוספת.';
+    const prompt = 'תמלל את ההקלטה לעברית מילה במילה. גם אם נאמרה רק מילה אחת קצרה כמו "שלום" או "הלו", כתוב אותה. אם נאמרו מילים בשפה אחרת לצורך תרגום או חיפוש, כתוב אותן כפי שנאמרו. החזר אך ורק את המילים שנאמרו ללא שום תוספת.';
 
     let lastErr = '';
     for (const model of modelsToTry.slice(0, 4)) {
@@ -227,7 +227,18 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_TRANSCRIBE_ERR: ' + lastErr);
 }
 
-// 4. מנועי חיפוש מהירים במקביל (ויקיפדיה, תרגום גוגל, יוטיוב, אינטרנט, חדשות ומזג אוויר)
+// 4. בדיקה האם מדובר בשיחה רגילה ("שלום", "מה שלומך") או בשאלה שדורשת חיפוש אינטרנט חי
+function shouldPerformWebSearch(questionText) {
+    const clean = String(questionText || '').trim();
+    if (!clean) return false;
+
+    const conversationalGreetings = /^(שלום|שלום לך|שלום וברכה|הלו|היי|בוקר טוב|צהריים טובים|ערב טוב|לילה טוב|מה נשמע|מה שלומך|איך אתה|מי אתה|מה אתה יכול לעשות|תודה|תודה רבה|יישר כוח|בדיקה|ניסיון|אחת שתיים|שומעים אותי)$/i;
+    if (conversationalGreetings.test(clean)) {
+        return false;
+    }
+    return true;
+}
+
 function stripHtmlTags(str) {
     return String(str || '')
         .replace(/<[^>]*>/g, ' ')
@@ -254,7 +265,7 @@ async function searchWikipedia(queryText) {
 
         const heUrl = `https://he.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(cleanQ)}&utf8=&format=json&srlimit=2`;
         const res = await fetchWithTimeout(heUrl, {
-            headers: { 'User-Agent': 'YemotVoiceAssistant/13.0' }
+            headers: { 'User-Agent': 'YemotVoiceAssistant/14.0' }
         }, 2500);
 
         const summaries = [];
@@ -266,7 +277,7 @@ async function searchWikipedia(queryText) {
                 const sumUrl = `https://he.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
                 try {
                     const sumRes = await fetchWithTimeout(sumUrl, {
-                        headers: { 'User-Agent': 'YemotVoiceAssistant/13.0' }
+                        headers: { 'User-Agent': 'YemotVoiceAssistant/14.0' }
                     }, 2000);
                     if (sumRes.ok) {
                         const sumData = await sumRes.json();
@@ -408,6 +419,11 @@ async function searchStableWeb(queryText) {
 }
 
 async function fetchAllLiveSources(questionText) {
+    if (!shouldPerformWebSearch(questionText)) {
+        console.log(`[Conversational Input Detected] Skipping external search for: "${questionText}"`);
+        return '';
+    }
+
     const snippets = [];
     try {
         const topNewsUrl = `https://news.google.com/rss?hl=iw&gl=IL&ceid=IL:he`;
@@ -454,7 +470,7 @@ async function fetchAllLiveSources(questionText) {
     return snippets.join('\n\n');
 }
 
-// 5. מענה חכם ומהיר ב-Gemini
+// 5. מענה חכם ומפורט ב-Gemini (תומך גם בשיחה רגילה וגם בתשובות מפורטות עד 10 משפטים)
 async function answerQuestionWithLiveSearch(questionText, callHistory = []) {
     const [models, liveWebData] = await Promise.all([
         getSmartGeminiModels(),
@@ -476,20 +492,20 @@ async function answerQuestionWithLiveSearch(questionText, callHistory = []) {
 
     let historyContext = '';
     if (callHistory.length > 0) {
-        const recent = callHistory.slice(-3).map(h => `שאלה קודמת: ${h.q}\nתשובה קודמת: ${h.a}`).join('\n');
-        historyContext = `\nהיסטוריית השיחה הנוכחית (התייחס אליה אם המשתמש שואל שאלת המשך):\n${recent}\n`;
+        const recent = callHistory.slice(-4).map(h => `המשתמש אמר: ${h.q}\nענית לו: ${h.a}`).join('\n');
+        historyContext = `\nהיסטוריית השיחה הנוכחית:\n${recent}\n`;
     }
 
-    const prompt = `אתה עוזר קולי חכם, בקיא ומדויק במערכת טלפונית, הדובר בלשון זכר בלבד.
+    const prompt = `אתה עוזר קולי חכם, אדיב, בקיא ומדויק במערכת טלפונית, הדובר בלשון זכר בלבד.
 התאריך והשעה הנוכחיים בישראל: ${nowStr}.
-${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמן אמת מוויקיפדיה, Google Translate, אינטרנט, יוטיוב, חדשות ומזג אוויר:\n${liveWebData}\n` : ''}${historyContext}
-שאלת המשתמש: "${questionText}"
+${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמן אמת מוויקיפדיה, Google Translate, אינטרנט, יוטיוב, חדשות ומזג אוויר (השתמש בו רק אם הוא רלוונטי לשאלת המשתמש):\n${liveWebData}\n` : ''}${historyContext}
+פניית המשתמש כעת: "${questionText}"
 
 הנחיות מחייבות:
-1. ענה ישירות ובדיוק מרבי על שאלת המשתמש בהתבסס על הנתונים החיים שלמעלה ועל הידע שלך.
-2. אם השאלה עוסקת בוויקיפדיה, תרגום, סרטונים ביוטיוב, חדשות או מזג אוויר - התבסס בראש ובראשונה על התוצאות החיות שמופיעות למעלה.
-3. נסח תשובה תמציתית, ברורה וטבעית להקראה בטלפון בעברית (בין 2 ל-4 משפטים שלמים). אל תקטע משפטים באמצע.
-4. כתוב טקסט נקי בלבד ללא כוכביות, ללא סולמיות, ללא קישורים וללא תווי עיצוב.`;
+1. אם המשתמש פונה בברכה או שיחה רגילה (כמו "שלום", "מה שלומך", "תודה", "מי אתה") - ענה לו בנימוס, בטבעיות ובמאור פנים כעוזר קולי חכם שמוכן לעזור בכל שאלה.
+2. אם המשתמש שואל שאלת מידע, תוכן, תרגום, ויקיפדיה, סרטונים ביוטיוב, חדשות או מזג אוויר - ענה בהרחבה ובדיוק מרבי בהתבסס על הנתונים החיים שלמעלה ועל הידע שלך.
+3. התאם את אורך התשובה לשאלה: ניתן לענות בהרחבה עד 10 משפטים שלמים וברורים. אל תקטע משפטים באמצע.
+4. כתוב טקסט נקי בלבד המותאם להקראה, ללא כוכביות, ללא סולמיות, ללא קישורים וללא תווי עיצוב.`;
 
     let lastErr = '';
     for (const model of models.slice(0, 4)) {
@@ -501,18 +517,18 @@ ${liveWebData ? `\nלהלן מידע חי ומדויק שנשלף כעת בזמ�
                 body: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }],
                     generationConfig: {
-                        temperature: 0.2,
-                        maxOutputTokens: 1024
+                        temperature: 0.25,
+                        maxOutputTokens: 2048
                     }
                 })
-            }, 11000);
+            }, 12000);
 
             if (res.ok) {
                 const data = await res.json();
                 const parts = (data?.candidates?.[0]?.content?.parts || []).filter(p => !p.thought && p.text);
                 const answer = parts.map(p => p.text).join(' ').trim();
 
-                if (answer && answer.length > 2) {
+                if (answer && answer.length >= 2) {
                     console.log(`[Gemini Answer Success] Model: ${model} | Answer:`, answer);
                     return answer;
                 }
@@ -562,7 +578,7 @@ async function generateGeminiMaleVoiceWavBuffer(textToSpeak, requestedVoice) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    contents: [{ parts: [{ text: textToSpeak }] }],
+                    contents: [{ parts: [{ text: `קרא בקול ברור: ${textToSpeak}` }] }],
                     generationConfig: {
                         responseModalities: ['AUDIO'],
                         speechConfig: {
@@ -572,7 +588,7 @@ async function generateGeminiMaleVoiceWavBuffer(textToSpeak, requestedVoice) {
                         }
                     }
                 })
-            }, 9500);
+            }, 13000);
 
             if (res.ok) {
                 const data = await res.json();
@@ -596,7 +612,7 @@ async function generateGeminiMaleVoiceWavBuffer(textToSpeak, requestedVoice) {
     return null;
 }
 
-// 7. ניקוי הטקסט והרכבת פקודת השמעה תקנית לימות המשיח (לגיבוי)
+// 7. ניקוי הטקסט והרכבת פקודת השמעה תקנית לימות המשיח (לגיבוי מלא עד 10 משפטים)
 function sanitizeForYemotTts(rawText) {
     return String(rawText || '')
         .replace(/https?:\/\/\S+/gi, ' ')
@@ -625,17 +641,17 @@ function buildYemotTtsPlayCommand(rawText) {
     }
     if (current) chunks.push(current);
 
-    return chunks.slice(0, 20).map(c => `t-${c}`).join('.');
+    return chunks.slice(0, 35).map(c => `t-${c}`).join('.');
 }
 
-// 8. הפקת קובץ השמע בקולו הגברי של גימיני, העלאתו לשלוחת ההשמעות והחזרת פקודת השמעה ישירה לשלוחה 2!
+// 8. הפקת קובץ השמע בקולו הגברי של גימיני, העלאתו לשלוחת ההשמעות והחזרת פקודת השמעה ישירה לשלוחה 2
 async function createAndUploadGeminiVoiceAnswer(archiveExt, questionText, answerText, callerPhone, recFilePath, maleVoice) {
     const targetExt = normalizeFolder(archiveExt);
     const nextNum = await getNextFileNumberStr(targetExt);
     const nowStr = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
     const cleanAns = sanitizeForYemotTts(answerText);
 
-    // שמירת קובץ טקסט מפורט בארכיון ברקע (אינו מעכב את השיחה)
+    // שמירת קובץ טקסט מפורט בארכיון ברקע
     const txtDetails = `שאלה: ${questionText}\r\nתשובה: ${answerText}\r\nקול גברי: ${getValidatedMaleVoice(maleVoice)}\r\nטלפון: ${callerPhone || 'לא ידוע'}\r\nזמן: ${nowStr}\r\nהקלטה מקורית: ${recFilePath || ''}\r\n`;
     const txtTargetPath = `ivr2:/${targetExt}/${nextNum}.txt`;
     const txtForm = new FormData();
@@ -645,7 +661,7 @@ async function createAndUploadGeminiVoiceAnswer(archiveExt, questionText, answer
     txtForm.append('file', new Blob([Buffer.from(txtDetails, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.txt`);
     fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: txtForm }, 8000).catch(() => null);
 
-    // יצירת קובץ הקול הגברי של גימיני עבור התשובה
+    // יצירת קובץ הקול הגברי של גימיני עבור התשובה והשמעתו ישירות בשלוחה 2
     try {
         const geminiWavBuf = await generateGeminiMaleVoiceWavBuffer(cleanAns, maleVoice);
         if (geminiWavBuf && geminiWavBuf.length > 500) {
@@ -656,7 +672,7 @@ async function createAndUploadGeminiVoiceAnswer(archiveExt, questionText, answer
             wavForm.append('convertAudio', '1');
             wavForm.append('file', new Blob([geminiWavBuf], { type: 'audio/wav' }), `${nextNum}.wav`);
 
-            const upRes = await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: wavForm }, 11000);
+            const upRes = await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: wavForm }, 12000);
             if (upRes.ok) {
                 const upJson = await upRes.json().catch(() => ({}));
                 if (!upJson.responseStatus || upJson.responseStatus === 'OK') {
@@ -669,7 +685,7 @@ async function createAndUploadGeminiVoiceAnswer(archiveExt, questionText, answer
         console.warn('[Gemini Male Voice Upload Fallback]:', e.message);
     }
 
-    // גיבוי: אם ה-TTS של גימיני התעכב, שומר .tts בארכיון ומשמיע מיד כדי שהשיחה לא תיقطع
+    // גיבוי: שמירת .tts בארכיון והשמעה מיידית אם ה-TTS התעכב
     const ttsTargetPath = `ivr2:/${targetExt}/${nextNum}.tts`;
     const ttsForm = new FormData();
     ttsForm.append('token', TOKEN);
@@ -682,7 +698,7 @@ async function createAndUploadGeminiVoiceAnswer(archiveExt, questionText, answer
 }
 
 app.get('/', (req, res) => {
-    res.send(`Gemini Live Search Line Server v13.0 OK - Direct Gemini Male Voice (${DEFAULT_MALE_VOICE}) in Extension 2`);
+    res.send(`Gemini Live Search Line Server v14.0 OK - Conversational + Search, Up to 10 Sentences, Male Voice (${DEFAULT_MALE_VOICE})`);
 });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
@@ -698,7 +714,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send('noop');
         }
 
-        // קליטת שלוחת ההשמעות והקול הגברי הנבחר
         const archiveExt = normalizeFolder(q.archive || DEFAULT_ARCHIVE_EXT);
         const maleVoice = getValidatedMaleVoice(q.voice || DEFAULT_MALE_VOICE);
         const recFolder = `/${archiveExt}`;
@@ -712,7 +727,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send('read=t-לשיחה עם העוזר הקולי הקישו 1 לשמיעת התשובה האחרונה הקישו 2=MenuChoice,no,1,1,7,Digits,no');
         }
 
-        // הקשה על 2: השמעת התשובה האחרונה (בקולו הגברי של גימיני) ומיד לאחריה פתיחת הקלטה לשאלה חדשה
+        // הקשה על 2: השמעת התשובה האחרונה ומיד לאחריה פתיחת הקלטה לשאלה חדשה
         if (q.MenuChoice === '2' && !latestRecordPath) {
             const prev = (callerPhone && lastAnswerByPhone.get(callerPhone)) || globalLastAnswer;
             const nextRecNum = await getNextFileNumberStr(archiveExt);
@@ -757,7 +772,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send(`id_list_message=t-לא הצלחתי לשמוע את השאלה&read=t-אנא אמרו שוב את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${retryNum},no,7,1`);
         }
 
-        // שלב 4: חיפוש חי מהיר ומענה ב-Gemini
+        // שלב 4: מענה חכם (לשיחה רגילה או שאלות חיפוש) עד 10 משפטים
         const callHistory = conversationHistoryByCall.get(callId) || [];
         let rawAnswer = '';
         try {
@@ -772,7 +787,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         callHistory.push({ q: cleanQuestion, a: rawAnswer });
         conversationHistoryByCall.set(callId, callHistory);
 
-        // שלב 5: הפקת קובץ השמע בקולו הגברי של גימיני והשמעתו ישירות בשלוחה 2!
+        // שלב 5: הפקת קובץ השמע בקולו הגברי של גימיני והשמעתו ישירות בשלוחה 2
         const playCmd = await createAndUploadGeminiVoiceAnswer(archiveExt, cleanQuestion, rawAnswer, callerPhone, latestRecordPath, maleVoice);
 
         const savedInfo = { playCmd, question: cleanQuestion, time: Date.now() };
@@ -784,7 +799,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`id_list_message=${playCmd}&read=t-לשאלה נוספת אמרו כעת את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},rec_${nextRecNum},no,7,1`);
 
     } catch (e) {
-        console.error('[General Error v13.0]', e.message);
+        console.error('[General Error v14.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -792,4 +807,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Gemini Voice Assistant v13.0 Ready on port ${port} (Male Voice: ${DEFAULT_MALE_VOICE}) ===`));
+app.listen(port, () => console.log(`=== Gemini Voice Assistant v14.0 Ready on port ${port} (Male Voice: ${DEFAULT_MALE_VOICE}) ===`));
