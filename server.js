@@ -9,14 +9,14 @@ const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const YM = 'https://www.call2all.co.il/ym/api/';
 const TEXT_ARCHIVE_EXT = '8';
 
-let cachedTranscribeModel = null;
-let cachedSearchModel = null;
+let cachedModelList = null;
+let lastModelFetchTime = 0;
 const lastAnswerByPhone = new Map();
 const conversationHistoryByCall = new Map();
 let globalLastAnswer = null;
 const folderCounters = {};
 
-async function fetchWithTimeout(url, options = {}, timeout = 22000) {
+async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
     try {
@@ -104,13 +104,20 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     throw new Error('YEMOT_DOWNLOAD_ERR: ' + lastYemotResponse);
 }
 
-// 2. איתור מודלים תומכי חיפוש גוגל חי (מעדיף את סדרת 2.5/2.0 היציבה ביותר ב-Google Search Grounding)
-async function getSearchCapableModels() {
-    const preferredOrder = [
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
+// 2. איתור מודלים זמינים בעלי מכסה גבוהה (מסנן אוטומטית את 2.5 ו-1.5 שנסגרו למשתמשים חדשים ומחזירים 404)
+async function getHighQuotaGeminiModels() {
+    const defaultFastOrder = [
+        'gemini-flash-lite-latest',
+        'gemini-3.5-flash-lite',
+        'gemini-3.5-flash',
+        'gemini-3.8-flash',
         'gemini-flash-latest'
     ];
+
+    if (cachedModelList && (Date.now() - lastModelFetchTime < 300000)) {
+        return cachedModelList;
+    }
+
     try {
         const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 6000);
         if (res.ok) {
@@ -119,46 +126,45 @@ async function getSearchCapableModels() {
                 .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
                 .map(m => m.name.replace('models/', ''))
                 .filter(m =>
+                    !m.includes('2.5') &&
+                    !m.includes('2.0') &&
                     !m.includes('1.5') &&
                     !m.includes('tts') &&
                     !m.includes('image') &&
                     !m.includes('robotics') &&
                     !m.includes('research') &&
                     !m.includes('computer-use') &&
-                    !m.includes('embedding')
+                    !m.includes('embedding') &&
+                    !m.includes('pro')
                 );
 
             const matched = [];
-            for (const pref of preferredOrder) {
+            for (const pref of defaultFastOrder) {
                 if (available.includes(pref)) matched.push(pref);
             }
             for (const m of available) {
-                if (m.includes('flash') && !m.includes('lite') && !matched.includes(m)) {
+                if ((m.includes('flash') || m.includes('lite')) && !matched.includes(m)) {
                     matched.push(m);
                 }
             }
-            if (matched.length > 0) return matched;
+            if (matched.length > 0) {
+                cachedModelList = matched;
+                lastModelFetchTime = Date.now();
+                console.log('[Available High-Quota Models]:', JSON.stringify(matched));
+                return matched;
+            }
         }
     } catch (e) {}
-    return preferredOrder;
+    return defaultFastOrder;
 }
 
-// 3. זיהוי דיבור מהיר ומלא (תומך בהקלטות ארוכות ללא חיתוך)
+// 3. תמלול מהיר ומדויק של השאלה (ללא חיתוך)
 async function transcribeAudio(audioBase64) {
-    const models = await getSearchCapableModels();
-    const transcribeList = [
-        ...(cachedTranscribeModel ? [cachedTranscribeModel] : []),
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
-        'gemini-flash-lite-latest',
-        ...models
-    ];
-    const uniqueModels = [...new Set(transcribeList)];
-
-    const prompt = 'תמלל את ההקלטה לעברית מילה במילה. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת וללא הסברים.';
+    const modelsToTry = await getHighQuotaGeminiModels();
+    const prompt = 'תמלל את ההקלטה לעברית מילה במילה. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת, ללא סימני פיסוק וללא הסברים.';
 
     let lastErr = '';
-    for (const model of uniqueModels.slice(0, 4)) {
+    for (const model of modelsToTry.slice(0, 5)) {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
         try {
             const res = await fetchWithTimeout(url, {
@@ -173,7 +179,7 @@ async function transcribeAudio(audioBase64) {
                     }],
                     generationConfig: {
                         temperature: 0.1,
-                        maxOutputTokens: 2048
+                        maxOutputTokens: 1024
                     }
                 })
             }, 12000);
@@ -183,12 +189,12 @@ async function transcribeAudio(audioBase64) {
                 const parts = (data?.candidates?.[0]?.content?.parts || []).filter(p => !p.thought && p.text);
                 const text = parts.map(p => p.text).join(' ').trim();
                 if (text) {
-                    cachedTranscribeModel = model;
                     console.log(`[Gemini Transcribe] Model ${model} success:`, JSON.stringify(text));
                     return text;
                 }
             } else {
                 lastErr = await res.text();
+                console.warn(`[Transcribe ${model} failed ${res.status}]:`, lastErr.slice(0, 140));
             }
         } catch (err) {
             lastErr = err.message;
@@ -197,20 +203,140 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_TRANSCRIBE_ERR: ' + lastErr);
 }
 
-// 4. שליפת נתונים חיים מרשת האינטרנט (Google News RSS בעברית + מזג אוויר חי בישראל) להבטחת עדכניות של 100%
-async function fetchLiveIsraelContext(questionText) {
+// 4. חיפוש חי בזמן אמת ישירות מהשרת (חיפוש אינטרנט, יוטיוב, חדשות ומזג אוויר - ללא צורך במכסת Google Search Grounding!)
+function stripHtmlTags(str) {
+    return String(str || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+async function searchYouTubeLatestVideos(queryText) {
+    try {
+        const cleanQ = queryText
+            .replace(/תחפש לי|חפש לי|באינטרנט|ביוטיוב|מה השם של|מהו|תגיד לי/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim() || queryText;
+
+        // שליפת דף תוצאות ממוין לפי תאריך העלאה או רלוונטיות מיוטיוב
+        const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanQ)}&sp=CAI%253D`;
+        const ytRelevanceUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanQ)}`;
+
+        const [dateRes, relRes] = await Promise.allSettled([
+            fetchWithTimeout(ytUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'he-IL,he;q=0.9' } }, 5000),
+            fetchWithTimeout(ytRelevanceUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'he-IL,he;q=0.9' } }, 5000)
+        ]);
+
+        const extractYtVideos = (html) => {
+            const list = [];
+            const regex = /"videoRenderer":\{"videoId":"[^"]+","thumbnail":\{.*?\},"title":\{"runs":\[\{"text":"([^"]+)"\}\].*?"publishedTimeText":\{"simpleText":"([^"]+)"\}/g;
+            let m;
+            while ((m = regex.exec(html)) !== null && list.length < 5) {
+                list.push(`- "${m[1]}" (זמן העלאה: ${m[2]})`);
+            }
+            return list;
+        };
+
+        const combined = [];
+        if (dateRes.status === 'fulfilled' && dateRes.value.ok) {
+            const html = await dateRes.value.text();
+            combined.push(...extractYtVideos(html));
+        }
+        if (relRes.status === 'fulfilled' && relRes.value.ok) {
+            const html = await relRes.value.text();
+            combined.push(...extractYtVideos(html));
+        }
+
+        const unique = [...new Set(combined)].slice(0, 6);
+        if (unique.length > 0) {
+            return `תוצאות חיות מיוטיוב עבור "${cleanQ}":\n${unique.join('\n')}`;
+        }
+    } catch (e) {
+        console.warn('[YouTube Live Search Warning]:', e.message);
+    }
+    return '';
+}
+
+async function searchDuckDuckGoWeb(queryText) {
+    try {
+        const cleanQ = queryText
+            .replace(/תחפש לי|חפש לי|באינטרנט|תגיד לי|מהו|מהי/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim() || queryText;
+
+        const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(cleanQ)}&kl=il-he`;
+        const res = await fetchWithTimeout(ddgUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept-Language': 'he-IL,he;q=0.9'
+            }
+        }, 5000);
+
+        if (res.ok) {
+            const html = await res.text();
+            const results = [];
+            const snippetRegex = /<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+            const titleRegex = /<a rel="nofollow" class="result__a"[^>]*>([\s\S]*?)<\/a>/g;
+
+            const titles = [];
+            let tm;
+            while ((tm = titleRegex.exec(html)) !== null && titles.length < 6) {
+                titles.push(stripHtmlTags(tm[1]));
+            }
+
+            let sm;
+            let idx = 0;
+            while ((sm = snippetRegex.exec(html)) !== null && results.length < 5) {
+                const snippet = stripHtmlTags(sm[1]);
+                const title = titles[idx] || '';
+                if (snippet) {
+                    results.push(`- ${title}: ${snippet}`);
+                }
+                idx++;
+            }
+
+            if (results.length > 0) {
+                return `תוצאות חיפוש אינטרנט חי עבור "${cleanQ}":\n${results.join('\n')}`;
+            }
+        }
+    } catch (e) {
+        console.warn('[Web Search Warning]:', e.message);
+    }
+    return '';
+}
+
+async function fetchLiveWebAndNewsContext(questionText) {
     const snippets = [];
     try {
-        // שליפת חיפוש עדכני מ-Google News בעברית לפי שאלת המשתמש או חדשות ראשיות
-        const searchTerms = encodeURIComponent(questionText);
-        const rssUrl = `https://news.google.com/rss/search?q=${searchTerms}+when:2d&hl=iw&gl=IL&ceid=IL:he`;
-        const topNewsUrl = `https://news.google.com/rss?hl=iw&gl=IL&ceid=IL:he`;
+        const cleanSearchQ = questionText
+            .replace(/תחפש לי|חפש לי|באינטרנט|תגיד לי/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim() || questionText;
 
-        const [searchRes, topRes, weatherRes] = await Promise.allSettled([
-            fetchWithTimeout(rssUrl, {}, 4500),
+        const rssSearchUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(cleanSearchQ)}&hl=iw&gl=IL&ceid=IL:he`;
+        const topNewsUrl = `https://news.google.com/rss?hl=iw&gl=IL&ceid=IL:he`;
+        const weatherUrl = 'https://api.open-meteo.com/v1/forecast?latitude=31.7683,32.0853,29.5577&longitude=35.2137,34.7818,34.9519&current=temperature_2m&daily=temperature_2m_max,temperature_2m_min&timezone=Asia%2FJerusalem&forecast_days=2';
+
+        const [webRes, ytRes, newsSearchRes, topNewsRes, weatherRes] = await Promise.allSettled([
+            searchDuckDuckGoWeb(questionText),
+            searchYouTubeLatestVideos(questionText),
+            fetchWithTimeout(rssSearchUrl, {}, 4500),
             fetchWithTimeout(topNewsUrl, {}, 4500),
-            fetchWithTimeout('https://api.open-meteo.com/v1/forecast?latitude=31.7683,32.0853,29.5577&longitude=35.2137,34.7818,34.9519&current=temperature_2m&daily=temperature_2m_max,temperature_2m_min&timezone=Asia%2FJerusalem&forecast_days=2', {}, 4500)
+            fetchWithTimeout(weatherUrl, {}, 4500)
         ]);
+
+        if (webRes.status === 'fulfilled' && webRes.value) {
+            snippets.push(webRes.value);
+        }
+
+        if (ytRes.status === 'fulfilled' && ytRes.value) {
+            snippets.push(ytRes.value);
+        }
 
         if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
             const wData = await weatherRes.value.json();
@@ -218,11 +344,11 @@ async function fetchLiveIsraelContext(questionText) {
                 const jlm = wData[0];
                 const tlv = wData[1];
                 const eil = wData[2];
-                snippets.push(`נתוני מזג אוויר חיים להיום ומחר בישראל (מתוך תחנות מטאורולוגיות בזמן אמת): ירושלים כעת ${jlm.current?.temperature_2m}°C (היום ${jlm.daily?.temperature_2m_min?.[0]}-${jlm.daily?.temperature_2m_max?.[0]}°C, מחר ${jlm.daily?.temperature_2m_min?.[1]}-${jlm.daily?.temperature_2m_max?.[1]}°C), תל אביב כעת ${tlv.current?.temperature_2m}°C (היום עד ${tlv.daily?.temperature_2m_max?.[0]}°C, מחר עד ${tlv.daily?.temperature_2m_max?.[1]}°C), אילת כעת ${eil.current?.temperature_2m}°C (היום עד ${eil.daily?.temperature_2m_max?.[0]}°C, מחר עד ${eil.daily?.temperature_2m_max?.[1]}°C).`);
+                snippets.push(`נתוני מזג אוויר חיים בישראל כעת: ירושלים כעת ${jlm.current?.temperature_2m}°C (היום ${jlm.daily?.temperature_2m_min?.[0]}-${jlm.daily?.temperature_2m_max?.[0]}°C, מחר ${jlm.daily?.temperature_2m_min?.[1]}-${jlm.daily?.temperature_2m_max?.[1]}°C), תל אביב כעת ${tlv.current?.temperature_2m}°C (היום עד ${tlv.daily?.temperature_2m_max?.[0]}°C, מחר עד ${tlv.daily?.temperature_2m_max?.[1]}°C), אילת כעת ${eil.current?.temperature_2m}°C (היום עד ${eil.daily?.temperature_2m_max?.[0]}°C, מחר עד ${eil.daily?.temperature_2m_max?.[1]}°C).`);
             }
         }
 
-        const extractTitles = (xmlText, limit = 6) => {
+        const extractRssItems = (xmlText, limit = 5) => {
             const items = [];
             const itemRegex = /<item>([\s\S]*?)<\/item>/g;
             let m;
@@ -231,7 +357,7 @@ async function fetchLiveIsraelContext(questionText) {
                 const tMatch = block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
                 const dMatch = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
                 if (tMatch && tMatch[1]) {
-                    const cleanTitle = tMatch[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').trim();
+                    const cleanTitle = stripHtmlTags(tMatch[1]);
                     const pubDate = dMatch ? dMatch[1].trim() : '';
                     items.push(`- ${cleanTitle} (${pubDate})`);
                 }
@@ -239,31 +365,30 @@ async function fetchLiveIsraelContext(questionText) {
             return items;
         };
 
-        if (searchRes.status === 'fulfilled' && searchRes.value.ok) {
-            const xml = await searchRes.value.text();
-            const found = extractTitles(xml, 5);
+        if (newsSearchRes.status === 'fulfilled' && newsSearchRes.value.ok) {
+            const xml = await newsSearchRes.value.text();
+            const found = extractRssItems(xml, 5);
             if (found.length > 0) {
-                snippets.push(`תוצאות אמת מהיממה האחרונה בחיפוש חדשות גוגל עבור "${questionText}":\n${found.join('\n')}`);
+                snippets.push(`תוצאות מחדשות גוגל עבור "${cleanSearchQ}":\n${found.join('\n')}`);
             }
         }
 
-        if (topRes.status === 'fulfilled' && topRes.value.ok) {
-            const xml = await topRes.value.text();
-            const topFound = extractTitles(xml, 6);
+        if (topNewsRes.status === 'fulfilled' && topNewsRes.value.ok) {
+            const xml = await topNewsRes.value.text();
+            const topFound = extractRssItems(xml, 5);
             if (topFound.length > 0) {
-                snippets.push(`כותרות החדשות הראשיות בישראל כעת (Google News Live):\n${topFound.join('\n')}`);
+                snippets.push(`כותרות החדשות הראשיות בישראל כעת:\n${topFound.join('\n')}`);
             }
         }
     } catch (e) {
-        console.warn('[Live Context Fetch Warning]', e.message);
+        console.warn('[Live Context Error]:', e.message);
     }
     return snippets.join('\n\n');
 }
 
-// 5. מענה לשאלה עם חיפוש חי של גוגל (Google Search Grounding) + נתוני זמן אמת
+// 5. מענה חכם ומדויק ללא חריגת מכסה (משתמש בנתוני החיפוש החיים שנשלפו על ידי השרת)
 async function answerQuestionWithLiveSearch(questionText, callHistory = []) {
-    const models = await getSearchCapableModels();
-    const uniqueModels = [...new Set(cachedSearchModel ? [cachedSearchModel, ...models] : models)];
+    const models = await getHighQuotaGeminiModels();
 
     const now = new Date();
     const nowStr = now.toLocaleString('he-IL', {
@@ -276,81 +401,62 @@ async function answerQuestionWithLiveSearch(questionText, callHistory = []) {
         minute: '2-digit'
     });
 
-    // משיכת נתוני אמת חיים (מזג אוויר וחדשות מהשעות האחרונות) במקביל
-    const liveWebContext = await fetchLiveIsraelContext(questionText);
+    const liveWebData = await fetchLiveWebAndNewsContext(questionText);
+    console.log(`[Live Search Context Gathered] (${liveWebData.length} chars)`);
 
     let historyContext = '';
     if (callHistory.length > 0) {
         const recent = callHistory.slice(-2).map(h => `שאלה קודמת: ${h.q}\nתשובה קודמת: ${h.a}`).join('\n');
-        historyContext = `\nהיסטוריית השיחה הנוכחית (התייחס אליה רק אם המשתמש שואל שאלת המשך ישירה):\n${recent}\n`;
+        historyContext = `\nהיסטוריית השיחה הנוכחית (התייחס אליה רק אם זו שאלת המשך ישירה):\n${recent}\n`;
     }
 
-    const prompt = `התאריך והשעה הנוכחיים בישראל: ${nowStr}.
-${liveWebContext ? `\nנתוני זמן אמת שנשלפו כעת מהאינטרנט עבורך:\n${liveWebContext}\n` : ''}${historyContext}
+    const prompt = `אתה עוזר קולי חכם ומדויק במערכת טלפונית.
+התאריך והשעה הנוכחיים בישראל: ${nowStr}.
+${liveWebData ? `\nלהלן תוצאות חיפוש חיות שנשלפו כעת בזמן אמת מהאינטרנט, מיוטיוב וממבזקי החדשות:\n${liveWebData}\n` : ''}${historyContext}
 שאלת המשתמש: "${questionText}"
 
 הנחיות מחייבות:
-1. בצע חיפוש עדכני ב-Google Search והסתמך על נתוני הזמן-אמת שלמעלה ועל תוצאות החיפוש מהיום בלבד.
-2. איסור מוחלט להביא חדשות ישנות או תחזיות משנים קודמות (כגון 2024 או 2025). התייחס אך ורק למה שקורה היום!
-3. ענה תשובה עניינית, ישירה, מדויקת וברורה בעברית באורך של 2 עד 5 משפטים שלמים.
-4. כתוב טקסט נקי להקראה בטלפון ללא שום כוכביות, סולמיות, מספור או קישורים.`;
+1. ענה ישירות ובמדויק על שאלת המשתמש בהתבסס על תוצאות החיפוש החיות שלמעלה ועל הידע שלך.
+2. אם המשתמש שאל על סרטון, שיעור אחרון ביוטיוב, חדשות או מזג אוויר - השתמש אך ורק בנתונים החיים שלמעלה.
+3. נסח תשובה ברורה, מלאה וטבעית להקראה בטלפון בעברית (בין 2 ל-5 משפטים שלמים). אל תקטע משפטים באמצע.
+4. כתוב טקסט נקי בלבד ללא כוכביות, ללא סולמיות, ללא קישורים וללא תווי עיצוב.`;
 
     let lastErr = '';
 
-    for (const model of uniqueModels.slice(0, 3)) {
+    for (const model of models.slice(0, 5)) {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
-
-        // מנסים תחילה עם כלי החיפוש המובנה של גוגל (google_search) על טקסט נקי
-        const payloads = [
-            {
-                contents: [{ parts: [{ text: prompt }] }],
-                tools: [{ google_search: {} }],
-                generationConfig: {
-                    temperature: 0.1,
-                    maxOutputTokens: 4096
-                }
-            },
-            {
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: {
-                    temperature: 0.1,
-                    maxOutputTokens: 4096
-                }
-            }
-        ];
-
-        for (const bodyObj of payloads) {
-            try {
-                const res = await fetchWithTimeout(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(bodyObj)
-                }, 18000);
-
-                if (res.ok) {
-                    const data = await res.json();
-                    const candidate = data?.candidates?.[0];
-                    const parts = (candidate?.content?.parts || []).filter(p => !p.thought && p.text);
-                    const answer = parts.map(p => p.text).join(' ').trim();
-
-                    if (answer && answer.length > 2) {
-                        cachedSearchModel = model;
-                        const searchQueries = candidate?.groundingMetadata?.webSearchQueries || [];
-                        console.log(`[Grounding Verified] Model: ${model} | Search Queries:`, JSON.stringify(searchQueries));
-                        console.log(`[Gemini Live Answer]`, answer);
-                        return answer;
+        try {
+            const res = await fetchWithTimeout(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: {
+                        temperature: 0.2,
+                        maxOutputTokens: 2048
                     }
-                } else {
-                    const errTxt = await res.text();
-                    console.warn(`[Model ${model} attempt failed]:`, errTxt.slice(0, 200));
-                    lastErr = errTxt;
+                })
+            }, 16000);
+
+            if (res.ok) {
+                const data = await res.json();
+                const parts = (data?.candidates?.[0]?.content?.parts || []).filter(p => !p.thought && p.text);
+                const answer = parts.map(p => p.text).join(' ').trim();
+
+                if (answer && answer.length > 2) {
+                    console.log(`[Gemini Answer Success] Model: ${model} | Answer:`, answer);
+                    return answer;
                 }
-            } catch (err) {
-                lastErr = err.message;
+            } else {
+                const errTxt = await res.text();
+                console.warn(`[Model ${model} failed ${res.status}]:`, errTxt.slice(0, 160));
+                lastErr = errTxt;
             }
+        } catch (err) {
+            lastErr = err.message;
         }
     }
-    throw new Error('GEMINI_SEARCH_ERR: ' + lastErr);
+    throw new Error('GEMINI_ANSWER_ERR: ' + lastErr);
 }
 
 // 6. ניקוי הטקסט והרכבת פקודת השמעה תקנית לימות המשיח
@@ -418,7 +524,7 @@ async function saveArchiveToExt8(questionText, answerText, callerPhone, recFileP
 }
 
 app.get('/', (req, res) => {
-    res.send('Gemini Live Search Line Server v5.0 OK - Verified Real-Time Search & Weather/News');
+    res.send('Gemini Live Search Line Server v6.0 OK - Quota-Free Live Web & YouTube Search');
 });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
@@ -473,7 +579,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send(`id_list_message=t-שגיאה בקליטת ההקלטה&read=t-אנא אמרו שוב את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${retryNum},no,7,1`);
         }
 
-        // שלב 3: זיהוי דיבור מהיר ומדויק
+        // שלב 3: זיהוי דיבור מהיר במודל עתיר מכסה
         let rawQuestion = '';
         try {
             rawQuestion = await transcribeAudio(audioBuf.toString('base64'));
@@ -491,7 +597,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send(`id_list_message=t-לא הצלחתי לשמוע את השאלה&read=t-אנא אמרו שוב את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${retryNum},no,7,1`);
         }
 
-        // שלב 4: חיפוש חי מאומת בזמן אמת וקבלת תשובה עדכנית להיום
+        // שלב 4: חיפוש חי מהשרת (אינטרנט, יוטיוב, חדשות ומזג אוויר) ומענה ב-Gemini ללא חריגת מכסה
         const callHistory = conversationHistoryByCall.get(callId) || [];
         let rawAnswer = '';
         try {
@@ -519,7 +625,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`id_list_message=${playCmd}&read=t-לשאלה נוספת אמרו כעת את שאלתכם ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${nextRecNum},no,7,1`);
 
     } catch (e) {
-        console.error('[General Error v5.0]', e.message);
+        console.error('[General Error v6.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -527,4 +633,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Gemini Voice Assistant v5.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Gemini Voice Assistant v6.0 Ready on port ${port} ===`));
