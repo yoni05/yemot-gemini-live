@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: yemot-gemini-live
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: YEMOT_TOKEN
+        sync: false
