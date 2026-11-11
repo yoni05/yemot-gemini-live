@@ -11,7 +11,7 @@ services:
       - key: NODE_VERSION
         value: "22"
       - key: ARCHIVE_EXT
-        value: "8"
+        value: "7"
       - key: GEMINI_VOICE
         value: "Puck"
       - key: GEMINI_API_KEY
